@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron')
 const path = require('path')
-const puppeteer = require('puppeteer')
+const https = require('https')
 const ExcelJS = require('exceljs')
 
 let mainWindow
@@ -19,6 +19,59 @@ function createWindow() {
   mainWindow.loadFile('index.html')
 }
 
+class Payload {
+  constructor(actor, input) {
+      this.actor = actor;
+      this.input = input;
+  }
+}
+
+function sendRequest(url) {
+  return new Promise((resolve, reject) => {
+    const host = "api.scrapeless.com";
+    const urlScrapper = `https://${host}/api/v1/scraper/request`;
+    const token = "sk_ndQZCLNmJT73I1OMbsEqQ4pmqFsZMhB71usbNBz8kJQfqPAoLrdlUziM1p2uQRrI";
+
+    const inputData = {
+      url,
+    };
+
+    const payload = new Payload("scraper.shopee", inputData);
+    const jsonPayload = JSON.stringify(payload);
+
+    const options = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+    };
+
+    const req = https.request(urlScrapper, options, (res) => {
+      let body = '';
+
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          resolve(body); // Resolve with raw response body
+        } catch (error) {
+          reject(new Error('Failed to process response: ' + error.message));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(new Error('Request failed: ' + error.message));
+    });
+
+    req.write(jsonPayload);
+    req.end();
+  });
+}
+
 // File dialog handler
 ipcMain.handle('open-file-dialog', async () => {
   const result = await dialog.showOpenDialog({
@@ -33,7 +86,6 @@ ipcMain.handle('open-file-dialog', async () => {
 
 // Excel processing handler
 ipcMain.handle('process-excel', async (_, filePath) => {
-  const browser = await puppeteer.launch({ headless: true })
   const outputPath = path.join(path.dirname(filePath), `results_${Date.now()}.xlsx`)
   
   const inputWorkbook = new ExcelJS.Workbook()
@@ -46,33 +98,53 @@ ipcMain.handle('process-excel', async (_, filePath) => {
 
   for (let i = 2; i <= inputSheet.rowCount; i++) {
     const url = inputSheet.getCell(`K${i}`).value
-    if (!url) continue
+    if (!url || !url.hyperlink) continue
 
     try {
-      const price = await getPrice(browser, url)
-      outputSheet.addRow([url, price, 'Success'])
+      console.log(`Processing URL: #${i}`);
+      const price = await getPrice(url.hyperlink)
+      outputSheet.addRow([url.hyperlink, price, 'Success'])
     } catch (error) {
-      outputSheet.addRow([url, 'N/A', `Error: ${error.message}`])
+      outputSheet.addRow([url.hyperlink, 'N/A', `Error: ${error.message}`])
       console.log(error.message);
-      
     }
   }
 
   await outputWorkbook.xlsx.writeFile(outputPath)
-  await browser.close()
   return outputPath
 })
 
-async function getPrice(browser, url) {
-  const page = await browser.newPage()
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-  
+async function getPrice(url) {
   try {
-    await page.goto(url.hyperlink, { waitUntil: 'networkidle2', timeout: 30000 })
-    await page.waitForSelector('div[class*="IZPeQz B67UQ0"]', { timeout: 300000 })
-    return await page.$eval('div[class*="IZPeQz B67UQ0"]', el => el.textContent.trim())
-  } finally {
-    await page.close()
+    const response = await sendRequest(url)
+    const data = JSON.parse(response)
+    
+    // Check for error in response
+    if (data.error) {
+      throw new Error(`API error ${data.error}: ${data.tracking_id || 'No tracking ID'}`)
+    }
+
+    // Extract price (adjust path based on actual API response structure)
+    // Assuming price is in data.result.price or similar
+    if(!data.data){
+      console.log(data);
+      throw new Error('Not My error, scrapeless API error');
+    }
+
+    const singleValue = data.data.data.product_price.price.single_value || 0;
+    const rangeMin = data.data.data.product_price.price.range_min || 'N/A';
+
+    // Use rangeMin if singleValue is less than or equal to 0
+    const price = singleValue > 0 ? singleValue : rangeMin;
+
+    if (price === 'N/A') {
+      throw new Error('Price not found in response')
+    }
+    
+    // Format price (assuming it's in smallest unit, e.g., cents or VND without decimals)
+    return (price / 100000) // Adjust divisor based on currency (e.g., 100 for VND)
+  } catch (error) {
+    throw new Error(`Failed to get price: ${error.message}`)
   }
 }
 
